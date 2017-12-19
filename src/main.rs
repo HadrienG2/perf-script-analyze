@@ -245,6 +245,7 @@ fn main() {
     let sample_analyzer = SampleAnalyzer::new();
 
     // We will aggregate statistics about the samples here
+    let mut num_samples = 0usize;
     let mut num_normal_samples = 0usize;
     let mut num_stack_less_samples = 0usize;
     let mut num_truncated_stacks = 0usize;
@@ -254,7 +255,10 @@ fn main() {
 
     // Now, let's have a look at the parsed samples
     while let Some(sample) = samples.next().unwrap() {
-        // Detect and report pathological samples
+        // Count the total amount of samples
+        num_samples += 1;
+
+        // Analyze incoming samples and aggregate some statistics
         use SampleCategory::*;
         match sample_analyzer.classify(&sample) {
             Normal => {
@@ -282,17 +286,20 @@ fn main() {
                 print!("Sample with an unusual top frame:");
             },
         }
+
+        // Print the full sample data for the weirdest ones
         println!("\n{}", sample.raw_sample_data);
     }
 
-    // Print the extracted statistics
+    // Print a summary of sample statistics at the end
     println!();
-    println!("Normal data samples: {}", num_normal_samples);
-    println!("Samples without a call stack: {}", num_stack_less_samples);
-    println!("Truncated DWARF stacks: {}", num_truncated_stacks);
-    println!("JIT-compiled samples: {}", num_jit_samples);
-    println!("Call stack broken by a bad DSO: {}", num_bad_dsos);
-    println!("Samples with an unusual top frame: {}", num_unexpected_samples);
+    println!("Total samples: {}", num_samples);
+    println!("- Normal data samples: {}", num_normal_samples);
+    println!("- Samples without a call stack: {}", num_stack_less_samples);
+    println!("- Truncated DWARF stacks: {}", num_truncated_stacks);
+    println!("- JIT-compiled samples: {}", num_jit_samples);
+    println!("- Call stack broken by a bad DSO: {}", num_bad_dsos);
+    println!("- Samples with an unusual top frame: {}", num_unexpected_samples);
 
     // Wait for the execution of perf script to complete
     perf_script.wait().unwrap();
