@@ -143,7 +143,7 @@ impl SampleAnalyzer {
         let mut last_frame_columns = last_stack_frame.split_whitespace();
 
         // The first column is the instruction pointer, we don't need it
-        let _instruction_pointer = last_frame_columns.next().unwrap();
+        let last_instruction_pointer = last_frame_columns.next().unwrap();
 
         // The second column is the function name, which is what we're after
         let last_function_name = last_frame_columns.next().unwrap();
@@ -153,7 +153,13 @@ impl SampleAnalyzer {
             return SampleCategory::Normal;
         }
 
-        // Otherwise, let us analyze it further. Perhaps it was JIT-compiled?
+        // Otherwise, let us analyze it further. First, perf uses an IP which is
+        // entirely composed of hex 'f's to denote incomplete DWARF stacks
+        if last_instruction_pointer.chars().all(|c| c == 'f') {
+            return SampleCategory::TruncatedStack;
+        }
+
+        // Perhaps the caller was JIT-compiled? Perf can detect this quite well.
         let last_dso = last_frame_columns.next().unwrap();
         const JIT_START: &str = "(/tmp/perf-";
         const JIT_END: &str = ".map)";
@@ -203,6 +209,9 @@ pub enum SampleCategory<'a> {
     /// This sample has no call stack attached to it.
     NoStackTrace,
 
+    /// This sample most likely originates from a truncated DWARF stack.
+    TruncatedStack,
+
     /// This sample was identified by perf as originating from a JIT compiler.
     /// The PID of the process which generated the code is attached.
     JitCompiledBy(u32),
@@ -211,7 +220,10 @@ pub enum SampleCategory<'a> {
     /// to be problematic. We still lost info, but at least we know why.
     BrokenByBadDSO(&'static str),
 
-    /// This sample has a fishy call stack for no known reason. 
+    /// This sample has an unusual function at the top of the call stack for no
+    /// clear reason. You may want to check perf script's --max-stack parameter.
+    /// I also _think_ that perf can get confused by constructors and
+    /// destructors of static objects sometimes, but don't quote me on this.
     UnexpectedTopFunc(&'a str),
 }
 
@@ -235,6 +247,7 @@ fn main() {
     // We will aggregate statistics about the samples here
     let mut num_normal_samples = 0usize;
     let mut num_stack_less_samples = 0usize;
+    let mut num_truncated_stacks = 0usize;
     let mut num_jit_samples = 0usize;
     let mut num_bad_dsos = 0usize;
     let mut num_unexpected_samples = 0usize;
@@ -250,6 +263,10 @@ fn main() {
             },
             NoStackTrace => {
                 num_stack_less_samples += 1;
+                continue;
+            },
+            TruncatedStack => {
+                num_truncated_stacks += 1;
                 continue;
             },
             JitCompiledBy(_pid) => {
@@ -272,6 +289,7 @@ fn main() {
     println!();
     println!("Normal data samples: {}", num_normal_samples);
     println!("Samples without a call stack: {}", num_stack_less_samples);
+    println!("Truncated DWARF stacks: {}", num_truncated_stacks);
     println!("JIT-compiled samples: {}", num_jit_samples);
     println!("Call stack broken by a bad DSO: {}", num_bad_dsos);
     println!("Samples with an unusual top frame: {}", num_unexpected_samples);
