@@ -169,8 +169,8 @@ impl SampleAnalyzer {
             return SampleCategory::JitCompiledBy(pid);
         }
 
-        // Perhaps it comes from a library known to break call stacks?
-        // Let us try to find the last sensible DSO in the call stack
+        // Perhaps it comes from a library that is known to break call stacks?
+        // Let us try to find the last sensible DSO in the call stack to check.
         let last_valid_dso =
             // Iterate over stack frames in reverse order
             sample.call_stack.lines().rev()
@@ -194,8 +194,15 @@ impl SampleAnalyzer {
             }
         }
 
-        // Sorry, I have no idea about what's going on :(
-        SampleCategory::UnexpectedTopFunc(last_function_name)
+        // If the last DSO is "[unkown]", the call stack is clearly broken, but
+        // at this stage I am out of ideas as for how that could happen
+        if last_dso == "([unknown])" {
+            return SampleCategory::BrokenLastFrame;
+        }
+
+        // If the last DSO is valid, but the top function of the call stack is
+        // unexpected, it should be reported as a possible --max-stack-problem.
+        SampleCategory::UnexpectedLastFunc(last_function_name)
     }
 }
 ///
@@ -220,11 +227,13 @@ pub enum SampleCategory<'a> {
     /// to be problematic. We still lost info, but at least we know why.
     BrokenByBadDSO(&'static str),
 
+    /// The bottom of the call stack is clearly broken for this sample, but
+    /// it is not clear how that could happen.
+    BrokenLastFrame,
+
     /// This sample has an unusual function at the top of the call stack for no
     /// clear reason. You may want to check perf script's --max-stack parameter.
-    /// I also _think_ that perf can get confused by constructors and
-    /// destructors of static objects sometimes, but don't quote me on this.
-    UnexpectedTopFunc(&'a str),
+    UnexpectedLastFunc(&'a str),
 }
 
 
@@ -251,7 +260,8 @@ fn main() {
     let mut num_truncated_stacks = 0usize;
     let mut num_jit_samples = 0usize;
     let mut num_bad_dsos = 0usize;
-    let mut num_unexpected_samples = 0usize;
+    let mut num_broken_last_frames = 0usize;
+    let mut num_unexpected_last_func = 0usize;
 
     // Now, let's have a look at the parsed samples
     while let Some(sample) = samples.next().unwrap() {
@@ -280,10 +290,14 @@ fn main() {
             BrokenByBadDSO(_dso) => {
                 num_bad_dsos += 1;
                 continue;
-            }
-            UnexpectedTopFunc(_name) => {
-                num_unexpected_samples += 1;
-                print!("Sample with an unusual top frame:");
+            },
+            BrokenLastFrame => {
+                num_broken_last_frames += 1;
+                print!("Sample where the last frame is broken:");
+            },
+            UnexpectedLastFunc(_name) => {
+                num_unexpected_last_func += 1;
+                print!("Sample with an unusual last function:");
             },
         }
 
@@ -299,7 +313,8 @@ fn main() {
     println!("- Truncated DWARF stacks: {}", num_truncated_stacks);
     println!("- JIT-compiled samples: {}", num_jit_samples);
     println!("- Call stack broken by a bad DSO: {}", num_bad_dsos);
-    println!("- Samples with an unusual top frame: {}", num_unexpected_samples);
+    println!("- Samples with broken last frame: {}", num_broken_last_frames);
+    println!("- Samples with unusual last frame: {}", num_unexpected_last_func);
 
     // Wait for the execution of perf script to complete
     perf_script.wait().unwrap();
