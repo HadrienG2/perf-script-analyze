@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Result};
 use std::process::{Command, Stdio};
 
 
-/// Mechanism to extract individual data samples from perf script's output
+/// Mechanism to extract individual samples from perf script's output
 struct PerfSamples<Input: Read> {
     input: BufReader<Input>,
     buffer: String,
@@ -16,7 +16,7 @@ struct PerfSamples<Input: Read> {
 //
 impl<Input: Read> PerfSamples<Input> {
     /// Initialize with a Rust reader plugging into the output of perf script
-    /// (can be stdin, a pipe to a child process... anything goes)
+    /// (can be stdin, a pipe to a child process, a file... anything goes)
     pub fn new(input: Input) -> Self {
         Self {
             input: BufReader::new(input),
@@ -26,14 +26,15 @@ impl<Input: Read> PerfSamples<Input> {
         }
     }
 
-    // Reset the reader's state (to be invoked when moving to a new sample)
+    // Reset the reader's state, to be invoked when moving to a new sample.
     fn reset(&mut self) {
         self.buffer.clear();
         self.header_len = 0;
         self.last_line_len = None;
     }
 
-    /// Extract and decode the next sample from perf script's output
+    /// Extract and decode the next sample from perf script's output, will
+    /// return Ok(None) when the end of perf script's output is reached.
     pub fn next(&mut self) -> Result<Option<Sample>> {
         // Reset the internal state of the sample reader
         self.reset();
@@ -42,12 +43,13 @@ impl<Input: Read> PerfSamples<Input> {
         // info such as the executable name, PID, event type, etc.
         self.header_len = self.load_next_line()?;
 
-        // Detect if the end of input was reached, and report it to the caller
+        // Detect if the end of input was reached, if so report it to the caller
         if self.header_len == 0 {
             return Ok(None);
         }
 
-        // Load input lines into the buffer until a newline or EOF is reached
+        // Load input lines into the buffer until a newline or EOF is reached,
+        // and record the position of the last useful byte in the buffer.
         let last_line_end = loop {
             let line_len = self.load_next_line()?;
             if line_len <= 1 {
@@ -67,7 +69,7 @@ impl<Input: Read> PerfSamples<Input> {
         Ok(Some(Sample {
             raw_sample_data: &self.buffer[..last_line_end],
             header: &self.buffer[..self.header_len],
-            call_stack: &self.buffer[self.header_len..last_line_end],
+            stack_trace: &self.buffer[self.header_len..last_line_end],
             last_stack_frame,
         }))
     }
@@ -79,27 +81,27 @@ impl<Input: Read> PerfSamples<Input> {
 }
 ///
 ///
-/// This struct models one call stack sample from perf script
+/// This struct models one stack trace from perf script
 #[derive(Debug)]
 struct Sample<'a> {
-    /// This is the raw sample data, if you need it for debugging purposes
+    /// This is the raw sample data, if you need it for custom processing
     pub raw_sample_data: &'a str,
 
     /// Header of the sample, where infos like the process ID lie
     pub header: &'a str,
 
-    /// Full call stack of the sample, in textual form
-    pub call_stack: &'a str,
+    /// Full stack trace of the sample, in textual form
+    pub stack_trace: &'a str,
 
-    /// Quick access to the last stack frame of the call stack, if any
+    /// Quick access to the last stack frame of the stack trace, if any
     pub last_stack_frame: Option<&'a str>,
 }
 
 
-/// Mechanism to analyze data samples and detect anomalies
+/// Mechanism to analyze pre-parsed data samples and detect anomalies
 struct SampleAnalyzer {
-    /// These are the functions which we expect to see at the top of call stacks
-    expected_top_funcs: HashSet<&'static str>,
+    /// These are the functions we expect to see at the end of stacks traces
+    expected_root_funcs: HashSet<&'static str>,
 
     /// These "bad" DSOs are known to leave broken stack frames around, most
     /// likely because we don't have DWARF debugging info for them
@@ -109,15 +111,15 @@ struct SampleAnalyzer {
 impl SampleAnalyzer {
     /// Setup a sample analyzer
     pub fn new() -> Self {
-        // These are the functions we expect to see on top of call stacks
-        let mut expected_top_funcs = HashSet::new();
-        expected_top_funcs.insert("_start");
-        expected_top_funcs.insert("native_irq_return_iret");
-        expected_top_funcs.insert("entry_SYSCALL_64_fastpath");
-        expected_top_funcs.insert("syscall_return_via_sysret");
-        expected_top_funcs.insert("__libc_start_main");
-        expected_top_funcs.insert("_dl_start_user");
-        expected_top_funcs.insert("__clone");
+        // These are the functions we expect to see on end of stack traces
+        let mut expected_root_funcs = HashSet::new();
+        expected_root_funcs.insert("_start");
+        expected_root_funcs.insert("native_irq_return_iret");
+        expected_root_funcs.insert("entry_SYSCALL_64_fastpath");
+        expected_root_funcs.insert("syscall_return_via_sysret");
+        expected_root_funcs.insert("__libc_start_main");
+        expected_root_funcs.insert("_dl_start_user");
+        expected_root_funcs.insert("__clone");
 
         // These DSOs are known to break stack traces (how evil of them!)
         let mut known_bad_dsos = HashSet::new();
@@ -126,7 +128,7 @@ impl SampleAnalyzer {
 
         // Return the analysis harness
         Self {
-            expected_top_funcs,
+            expected_root_funcs,
             known_bad_dsos,
         }
     }
@@ -142,20 +144,22 @@ impl SampleAnalyzer {
         // Split the last line into columns, ignoring whitespace
         let mut last_frame_columns = last_stack_frame.split_whitespace();
 
-        // The first column is the instruction pointer, we don't need it
+        // The first column is the instruction pointer for the last frame
         let last_instruction_pointer = last_frame_columns.next().unwrap();
 
         // The second column is the function name, which is what we're after
         let last_function_name = last_frame_columns.next().unwrap();
 
         // If the top function matches our expectations, we're good
-        if self.expected_top_funcs.contains(last_function_name) {
+        if self.expected_root_funcs.contains(last_function_name) {
             return SampleCategory::Normal;
         }
 
         // Otherwise, let us analyze it further. First, perf uses an IP which is
         // entirely composed of hex 'f's to denote incomplete DWARF stacks
-        if last_instruction_pointer.chars().all(|c| c == 'f') {
+        if last_instruction_pointer.len() % 8 == 0 &&
+           last_instruction_pointer.chars().all(|c| c == 'f')
+        {
             return SampleCategory::TruncatedStack;
         }
 
@@ -169,20 +173,20 @@ impl SampleAnalyzer {
             return SampleCategory::JitCompiledBy(pid);
         }
 
-        // Perhaps it comes from a library that is known to break call stacks?
-        // Let us try to find the last sensible DSO in the call stack to check.
+        // Perhaps it comes from a library that is known to break stack traces?
+        // Let us try to find the last sensible DSO in the trace to check.
         let last_valid_dso =
             // Iterate over stack frames in reverse order
-            sample.call_stack.lines().rev()
-                             // Find the DSO associated with each frame
-                             .map(|frame| frame.split_whitespace()
-                                               .rev()
-                                               .next()
-                                               .unwrap())
-                             // Look for the first valid DSO in the call stack
-                             .skip_while(|&dso| dso == "([unknown])")
-                             // Extract it and return it as an Option
-                             .next();
+            sample.stack_trace.lines().rev()
+                              // Find the DSO associated with each frame
+                              .map(|frame| frame.split_whitespace()
+                                                .rev()
+                                                .next()
+                                                .unwrap())
+                              // Look for the first valid DSO in the stack trace
+                              .skip_while(|&dso| dso == "([unknown])")
+                              // Extract it and return it as an Option
+                              .next();
 
         // Did we find a single sensible DSO in that stack?
         if let Some(valid_dso) = last_valid_dso {
@@ -194,13 +198,13 @@ impl SampleAnalyzer {
             }
         }
 
-        // If the last DSO is "[unkown]", the call stack is clearly broken, but
+        // If the last DSO is "[unkown]", the stack trace is clearly broken, but
         // at this stage I am out of ideas as for how that could happen
         if last_dso == "([unknown])" {
             return SampleCategory::BrokenLastFrame;
         }
 
-        // If the last DSO is valid, but the top function of the call stack is
+        // If the last DSO is valid, but the top function of the stack trace is
         // unexpected, it should be reported as a possible --max-stack-problem.
         SampleCategory::UnexpectedLastFunc(last_function_name)
     }
@@ -213,7 +217,7 @@ pub enum SampleCategory<'a> {
     /// This sample looks the way we expect, nothing special here.
     Normal,
 
-    /// This sample has no call stack attached to it.
+    /// This sample has no strack trace attached to it.
     NoStackTrace,
 
     /// This sample most likely originates from a truncated DWARF stack.
@@ -223,15 +227,15 @@ pub enum SampleCategory<'a> {
     /// The PID of the process which generated the code is attached.
     JitCompiledBy(u32),
 
-    /// This sample has a broken call stack, which features a DSO that is known
+    /// This sample has a broken stack trace, which features a DSO that is known
     /// to be problematic. We still lost info, but at least we know why.
     BrokenByBadDSO(&'static str),
 
-    /// The bottom of the call stack is clearly broken for this sample, but
+    /// The bottom of the stack trace is clearly broken for this sample, but
     /// it is not clear how that could happen.
     BrokenLastFrame,
 
-    /// This sample has an unusual function at the top of the call stack for no
+    /// This sample has an unusual function at the top of the stack trace for no
     /// clear reason. You may want to check perf script's --max-stack parameter.
     UnexpectedLastFunc(&'a str),
 }
@@ -277,26 +281,32 @@ fn main() {
             },
             NoStackTrace => {
                 num_stack_less_samples += 1;
+                // print!("Sample without a stack trace:");
                 continue;
             },
             TruncatedStack => {
                 num_truncated_stacks += 1;
+                // print!("Sample with a truncated stack:");
                 continue;
             },
             JitCompiledBy(_pid) => {
                 num_jit_samples += 1;
+                // print!("JIT-compiled samples:");
                 continue;
             },
             BrokenByBadDSO(_dso) => {
                 num_bad_dsos += 1;
+                //print!("Sample broken by a known bad DSO:");
                 continue;
             },
             BrokenLastFrame => {
                 num_broken_last_frames += 1;
-                print!("Sample where the last frame is broken:");
+                continue;
+                // print!("Sample where the last frame is broken:");
             },
             UnexpectedLastFunc(_name) => {
                 num_unexpected_last_func += 1;
+                // continue;
                 print!("Sample with an unusual last function:");
             },
         }
@@ -309,10 +319,10 @@ fn main() {
     println!();
     println!("Total samples: {}", num_samples);
     println!("- Normal data samples: {}", num_normal_samples);
-    println!("- Samples without a call stack: {}", num_stack_less_samples);
+    println!("- Samples without a stack trace: {}", num_stack_less_samples);
     println!("- Truncated DWARF stacks: {}", num_truncated_stacks);
     println!("- JIT-compiled samples: {}", num_jit_samples);
-    println!("- Call stack broken by a bad DSO: {}", num_bad_dsos);
+    println!("- Stack trace broken by a bad DSO: {}", num_bad_dsos);
     println!("- Samples with broken last frame: {}", num_broken_last_frames);
     println!("- Samples with unusual last frame: {}", num_unexpected_last_func);
 
