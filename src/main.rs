@@ -100,8 +100,11 @@ struct Sample<'a> {
 
 /// Mechanism to analyze pre-parsed data samples and detect anomalies
 struct SampleAnalyzer {
-    /// These are the functions we expect to see at the end of stacks traces
+    /// These are the functions we expect to see at the end of stack traces
     expected_root_funcs: HashSet<&'static str>,
+
+    /// These are the DSOs that we expect to see at the end of stack traces
+    expected_root_dsos: HashSet<&'static str>,
 
     /// These "bad" DSOs are known to leave broken stack frames around, most
     /// likely because we don't have DWARF debugging info for them
@@ -115,20 +118,24 @@ impl SampleAnalyzer {
         let mut expected_root_funcs = HashSet::new();
         expected_root_funcs.insert("_start");
         expected_root_funcs.insert("native_irq_return_iret");
-        expected_root_funcs.insert("entry_SYSCALL_64_fastpath");
-        expected_root_funcs.insert("syscall_return_via_sysret");
         expected_root_funcs.insert("__libc_start_main");
         expected_root_funcs.insert("_dl_start_user");
         expected_root_funcs.insert("__clone");
+
+        let mut expected_root_dsos = HashSet::new();
+        expected_root_dsos.insert("([kernel.kallsyms])");
+        expected_root_dsos.insert("(/usr/bin/perf)");
 
         // These DSOs are known to break stack traces (how evil of them!)
         let mut known_bad_dsos = HashSet::new();
         known_bad_dsos.insert("(/usr/lib64/xorg/modules/drivers/nvidia_drv.so)");
         known_bad_dsos.insert("(/usr/lib64/libGLX_nvidia.so.384.98)");
+        known_bad_dsos.insert("(/usr/lib64/libGLX_nvidia.so.384.98)");
 
         // Return the analysis harness
         Self {
             expected_root_funcs,
+            expected_root_dsos,
             known_bad_dsos,
         }
     }
@@ -147,11 +154,19 @@ impl SampleAnalyzer {
         // The first column is the instruction pointer for the last frame
         let last_instruction_pointer = last_frame_columns.next().unwrap();
 
-        // The second column is the function name, which is what we're after
+        // The second column is the function name
         let last_function_name = last_frame_columns.next().unwrap();
 
-        // If the top function matches our expectations, we're good
-        if self.expected_root_funcs.contains(last_function_name) {
+        // The last column is the DSO name
+        let last_dso = last_frame_columns.next().unwrap();
+
+        // After that, there may be an optional "(deleted))" marker
+        let opt_deleted = last_frame_columns.next();
+
+        // If the top function or DSO matches our expectations, we're good
+        if self.expected_root_dsos.contains(last_dso) ||
+           self.expected_root_funcs.contains(last_function_name)
+        {
             return SampleCategory::Normal;
         }
 
@@ -164,13 +179,19 @@ impl SampleAnalyzer {
         }
 
         // Perhaps the caller was JIT-compiled? Perf can detect this quite well.
-        let last_dso = last_frame_columns.next().unwrap();
         const JIT_START: &str = "(/tmp/perf-";
         const JIT_END: &str = ".map)";
         if last_dso.starts_with(JIT_START) && last_dso.ends_with(JIT_END) {
             let pid = &last_dso[JIT_START.len()..last_dso.len()-JIT_END.len()];
             let pid = pid.parse::<u32>().unwrap();
             return SampleCategory::JitCompiledBy(pid);
+        }
+
+        // Perf sometimes inserts strange "deleted" markers next to DSO names,
+        // which are correlated with bad stack traces. I should investigate
+        // these further, in the meantime I'll give them special treatment.
+        if opt_deleted == Some("(deleted))") {
+            return SampleCategory::DeletedByPerf;
         }
 
         // Perhaps it comes from a library that is known to break stack traces?
@@ -227,6 +248,10 @@ pub enum SampleCategory<'a> {
     /// The PID of the process which generated the code is attached.
     JitCompiledBy(u32),
 
+    /// This sample's last DSO has a (deleted) marker. Perf sometimes adds them,
+    /// I have no idea what they mean at this point in time.
+    DeletedByPerf,
+
     /// This sample has a broken stack trace, which features a DSO that is known
     /// to be problematic. We still lost info, but at least we know why.
     BrokenByBadDSO(&'static str),
@@ -263,6 +288,7 @@ fn main() {
     let mut num_stack_less_samples = 0usize;
     let mut num_truncated_stacks = 0usize;
     let mut num_jit_samples = 0usize;
+    let mut num_deleted = 0usize;
     let mut num_bad_dsos = 0usize;
     let mut num_broken_last_frames = 0usize;
     let mut num_unexpected_last_func = 0usize;
@@ -294,6 +320,11 @@ fn main() {
                 // print!("JIT-compiled samples:");
                 continue;
             },
+            DeletedByPerf => {
+                num_deleted += 1;
+                // print!("Deleted samples:");
+                continue;
+            }
             BrokenByBadDSO(_dso) => {
                 num_bad_dsos += 1;
                 //print!("Sample broken by a known bad DSO:");
@@ -301,8 +332,8 @@ fn main() {
             },
             BrokenLastFrame => {
                 num_broken_last_frames += 1;
-                continue;
                 // print!("Sample where the last frame is broken:");
+                continue;
             },
             UnexpectedLastFunc(_name) => {
                 num_unexpected_last_func += 1;
@@ -322,6 +353,7 @@ fn main() {
     println!("- Samples without a stack trace: {}", num_stack_less_samples);
     println!("- Truncated DWARF stacks: {}", num_truncated_stacks);
     println!("- JIT-compiled samples: {}", num_jit_samples);
+    println!("- Deleted samples: {}", num_deleted);
     println!("- Stack trace broken by a bad DSO: {}", num_bad_dsos);
     println!("- Samples with broken last frame: {}", num_broken_last_frames);
     println!("- Samples with unusual last frame: {}", num_unexpected_last_func);
